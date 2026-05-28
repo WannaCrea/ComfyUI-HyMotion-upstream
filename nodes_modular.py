@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import yaml
@@ -1570,6 +1571,25 @@ class HYMotionSampler:
     # Removed local smoothing helpers in favor of official MotionGeneration methods
 
 
+def _load_rig_mapping(rig_type: str):
+    """Load SMPL-H → target bone name mapping from rig_mappings/<rig_type>.json.
+
+    Returns None for 'smplx' (triggers SMPLH2WoodFBX auto-detect).
+    Falls back to None with a warning if the JSON is missing.
+    """
+    if rig_type == "smplx":
+        return None
+    mapping_dir = os.path.join(os.path.dirname(__file__), "hymotion", "rig_mappings")
+    path = os.path.join(mapping_dir, f"{rig_type}.json")
+    if not os.path.exists(path):
+        print(f"[HY-Motion] Warning: no mapping file for rig_type={rig_type!r} — falling back to auto-detect")
+        return None
+    with open(path, encoding="utf-8") as f:
+        mapping = json.load(f)
+    print(f"[HY-Motion] Loaded rig mapping: {rig_type} ({len(mapping)} joints)")
+    return mapping
+
+
 class HYMotionModularExportFBX:
     @classmethod
     def INPUT_TYPES(s):
@@ -1605,10 +1625,14 @@ class HYMotionModularExportFBX:
                 }),
             },
             "optional": {
+                "rig_type": (["smplx", "mixamo", "ue4_mannequin", "ue5_manny", "rigify_deform"], {
+                    "default": "smplx",
+                    "tooltip": "Target skeleton bone naming. smplx = SMPL-X auto-detect (default). Others load a pre-built mapping from hymotion/rig_mappings/<rig_type>.json — the template FBX must have matching bone names.",
+                }),
                 "batch_index": ("INT", {
-                    "default": 0, 
-                    "min": 0, 
-                    "max": 63, 
+                    "default": 0,
+                    "min": 0,
+                    "max": 63,
                     "step": 1,
                     "tooltip": "Which batch sample to use as primary output (for single-file workflows)."
                 }),
@@ -1641,8 +1665,9 @@ class HYMotionModularExportFBX:
     CATEGORY = "HY-Motion/modular"
     OUTPUT_NODE = True
 
-    def export_fbx(self, motion_data: HYMotionData, template_name: str, fps: float, output_dir: str, filename_prefix: str, 
-                   batch_index: int = 0, scale: float = 100.0, in_place: bool = False, in_place_x: bool = False, in_place_y: bool = False, in_place_z: bool = False,
+    def export_fbx(self, motion_data: HYMotionData, template_name: str, fps: float, output_dir: str, filename_prefix: str,
+                   rig_type: str = "smplx", batch_index: int = 0, scale: float = 100.0,
+                   in_place: bool = False, in_place_x: bool = False, in_place_y: bool = False, in_place_z: bool = False,
                    absolute_root: bool = True):
         # Resolve template path - use dropdown selection or fallback to default
         template_fbx_path = folder_paths.get_full_path("hymotion_fbx_templates", template_name)
@@ -1657,7 +1682,13 @@ class HYMotionModularExportFBX:
         try:
             import fbx
             from .hymotion.utils.smplh2woodfbx import SMPLH2WoodFBX
-            fbx_converter = SMPLH2WoodFBX(template_fbx_path=template_fbx_path, scale=scale, absolute_root=absolute_root)
+            rig_mapping = _load_rig_mapping(rig_type)
+            fbx_converter = SMPLH2WoodFBX(
+                template_fbx_path=template_fbx_path,
+                smplh_to_fbx_mapping=rig_mapping,
+                scale=scale,
+                absolute_root=absolute_root,
+            )
         except ImportError:
             msg = "Error: FBX SDK not installed. Please install it to use FBX export."
             print(f"[HY-Motion] {msg}")
@@ -1718,15 +1749,31 @@ class HYMotionModularExportFBX:
                 if success:
                     fbx_files.append(fbx_path)
                     print(f"[HY-Motion] FBX exported: {fbx_path}")
-                    
+
                     # Optionally save text prompt as metadata
                     txt_path = fbx_path.replace(".fbx", ".txt")
                     with open(txt_path, "w", encoding="utf-8") as f:
                         f.write(motion_data.text)
                 else:
-                    print(f"[HY-Motion] FBX export failed for batch {batch_idx}")
+                    import tempfile as _tf, os as _os2
+                    msg = f"[HY-Motion] FBX export returned False for batch {batch_idx} (template={template_fbx_path}, rig={rig_type})"
+                    print(msg)
+                    try:
+                        err_path = _os2.path.join(_tf.gettempdir(), "wdc_fbx_error.txt")
+                        with open(err_path, "w") as _ef:
+                            _ef.write(msg + "\n")
+                    except Exception:
+                        pass
             except Exception as e:
-                print(f"[HY-Motion] Export error: {e}")
+                import traceback, tempfile, os as _os
+                tb = traceback.format_exc()
+                print(f"[HY-Motion] Export error: {e}\n{tb}")
+                try:
+                    err_path = _os.path.join(tempfile.gettempdir(), "wdc_fbx_error.txt")
+                    with open(err_path, "w") as _f:
+                        _f.write(f"batch_idx={batch_idx}\nerror={e}\n\n{tb}")
+                except Exception:
+                    pass
                 continue
 
         # Return paths relative to ComfyUI output directory

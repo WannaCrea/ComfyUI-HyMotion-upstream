@@ -498,7 +498,16 @@ def _convert_smplh_to_woodfbx(
         os.remove(temp_file)
         print(f"Successfully saved FBX to: {save_fn}")
     except Exception as e:
-        print(f"Error saving FBX file: {e}")
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        print(f"Error saving FBX file: {e}\n{tb_str}")
+        try:
+            import tempfile as _tmpmod
+            err_path = os.path.join(_tmpmod.gettempdir(), "wdc_fbx_error.txt")
+            with open(err_path, "w") as _ef:
+                _ef.write(f"save_fn={save_fn}\nerror={e}\n\n{tb_str}")
+        except Exception:
+            pass
         return False
     finally:
         fbxManager.Destroy()

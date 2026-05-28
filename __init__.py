@@ -31,9 +31,12 @@ folder_paths.folder_names_and_paths["hymotion_text_encoders"] = (
     {".gguf", ".bin", ".safetensors", ".pt", ".ckpt"}
 )
 
-# Register FBX templates folder
+# Register FBX templates folder — also scan models/hymotion_fbx_templates/ for custom rigs
 folder_paths.folder_names_and_paths["hymotion_fbx_templates"] = (
-    [os.path.join(CURRENT_DIR, "assets", "wooden_models")],
+    [
+        os.path.join(CURRENT_DIR, "assets", "wooden_models"),
+        os.path.join(folder_paths.models_dir, "hymotion_fbx_templates"),
+    ],
     {".fbx"}
 )
 
