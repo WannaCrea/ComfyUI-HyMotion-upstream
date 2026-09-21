@@ -34,6 +34,14 @@ try:
 except ImportError:
     HAS_FBX_SDK = False
 
+
+# Tolerance for deciding whether keypoints3d already contain the root
+# translation (see load_npz). World-space keypoints agree with `transl` up to the
+# pelvis-centre offset, which measured 0.19 m on HyMotion output, while a
+# root-relative skeleton disagrees by roughly a full hip height (~0.8-1.3 m).
+# 0.35 m sits in the empty gap between the two populations.
+_ROOT_TRANSL_AGREEMENT_M = 0.35
+
 # =============================================================================
 # Math Utilities
 # =============================================================================
@@ -437,18 +445,35 @@ def load_npz(data_or_path: str | dict) -> Skeleton:
 
     T = kps.shape[0]
 
-    # HY-MOTION SYNC FIX: Detect if keypoints are already in World Space
-    # In some NPZ variants (like the user's), keypoints3d already includes translation.
-    # In others (standard SMPL), they are relative to Pelvis at origin.
+    # HY-MOTION SYNC FIX: Detect whether keypoints3d already carry the root
+    # translation, or are relative to the Pelvis at the origin.
+    #
+    # The original test compared horizontal travel to a fixed 0.1 m threshold.
+    # Travel only describes horizontal displacement, but the convention being
+    # probed is vertical, so the test is inverted for exactly the clips that
+    # matter: a walking clip has huge travel (>0.1 -> treated as world-space),
+    # an in-place clip almost none (<=0.1 -> treated as root-relative), while
+    # BOTH may already be world-space. Adding transl to world-space keypoints
+    # counts the root height twice and lifts the skeleton off the floor.
+    #
+    # Compare the keypoint root against transl directly instead: when they
+    # agree, the translation is already baked in and adding it again is wrong.
+    # Degenerate-safe: when both are ~0 the branch adds a zero vector, so the
+    # result is identical either way.
     kps_travel = np.linalg.norm(kps[-1, 0] - kps[0, 0])
-    if kps_travel > 0.1:
+    root_offset = float(np.linalg.norm((kps[:, 0, :] - transl).mean(axis=0)))
+    if root_offset < _ROOT_TRANSL_AGREEMENT_M:
         print(
-            f"[Retarget] NPZ Detect: Keypoints are already animated (Travel={kps_travel:.2f}m). Skipping Transl addition."
+            f"[Retarget] NPZ Detect: Keypoints already carry the root translation "
+            f"(root vs transl offset={root_offset:.3f}m, travel={kps_travel:.2f}m). "
+            f"Skipping Transl addition."
         )
         global_kps = kps.copy()
     else:
         print(
-            f"[Retarget] NPZ Detect: Keypoints are relative to root. Adding Transl vector."
+            f"[Retarget] NPZ Detect: Keypoints are relative to root "
+            f"(root vs transl offset={root_offset:.3f}m, travel={kps_travel:.2f}m). "
+            f"Adding Transl vector."
         )
         global_kps = kps + transl[:, np.newaxis, :]
 
@@ -1988,6 +2013,32 @@ def load_bone_mapping(
 # The Retargeting Engine
 # =============================================================================
 
+def _intrinsic_translation_offset(node):
+    """Translation FBX contributes to a node's world transform when LclTranslation is zero.
+
+    FBX composes a node's local transform as
+        T * RotationOffset * RotationPivot * PreRotation * R
+          * PostRotation^-1 * RotationPivot^-1 * S
+    The pre/rotation block therefore contributes a translation only when the node
+    carries a rotation pivot or offset; with no pivot that contribution is exactly
+    RotationOffset, which is zero on the bundled rigs.
+
+    Returns a 3-vector, or None when the node has a rotation pivot — in that case
+    the contribution depends on the animated rotation, so callers must fall back to
+    their previous behaviour rather than guess.
+    """
+    def _vec(prop):
+        try:
+            v = prop.Get()
+            return np.array([float(v[0]), float(v[1]), float(v[2])])
+        except Exception:
+            return np.zeros(3)
+
+    if float(np.abs(_vec(node.RotationPivot)).sum()) > 1e-6:
+        return None
+    return _vec(node.RotationOffset)
+
+
 def apply_retargeted_animation(
     scene, skeleton, ret_rots, ret_locs, fstart, fend, source_time_mode=None
 ):
@@ -2076,18 +2127,29 @@ def apply_retargeted_animation(
             tx.KeyModifyBegin()
             ty.KeyModifyBegin()
             tz.KeyModifyBegin()
-            # Correct translation to account for FBX's intrinsic world pose offset
-            rest_world_pos = skeleton.node_world_matrices.get(name, np.eye(4))[3, :3]
-            pnode = node.GetParent()
-            pname = pnode.GetName() if pnode else None
-            rest_parent_world_pos = (
-                skeleton.node_world_matrices.get(pname, np.eye(4))[3, :3]
-                if pname
-                else np.zeros(3)
-            )
-
-            # This is the offset that FBX evaluates even when LclTranslation is zero
-            intrinsic_offset = rest_world_pos - rest_parent_world_pos
+            # Correct translation to account for FBX's intrinsic world pose offset.
+            #
+            # This used to be `rest_world_pos - rest_parent_world_pos`, i.e. the
+            # bone's rest offset along its chain. That is a *pose* quantity, not an
+            # FBX node offset: the joint hierarchy already accounts for it, and FBX
+            # contributes no translation of its own when LclTranslation is zero and
+            # the node has no rotation pivot. Subtracting it dropped the root by its
+            # own rest height (Hips 0.998 m on the bundled Mixamo rig), which sank
+            # every retargeted character about a metre below the origin.
+            intrinsic_offset = _intrinsic_translation_offset(node)
+            if intrinsic_offset is None:
+                # Rotation pivot present: its translation contribution depends on
+                # the animated rotation. Keep the legacy rest-position subtraction
+                # so rigs that rely on it are bit-for-bit unaffected.
+                rest_world_pos = skeleton.node_world_matrices.get(name, np.eye(4))[3, :3]
+                pnode = node.GetParent()
+                pname = pnode.GetName() if pnode else None
+                rest_parent_world_pos = (
+                    skeleton.node_world_matrices.get(pname, np.eye(4))[3, :3]
+                    if pname
+                    else np.zeros(3)
+                )
+                intrinsic_offset = rest_world_pos - rest_parent_world_pos
 
             for f, loc in ret_locs[name].items():
                 t = FbxTime()
