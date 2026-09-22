@@ -2574,6 +2574,15 @@ def retarget_animation(
         angle = np.arctan2(fwd_transformed[0], fwd_transformed[1])
         global_pos_q = R.from_euler("z", angle)
 
+    # Positions need the source->target up-axis remap ON TOP of the heading yaw.
+    # global_pos_q alone is yaw-only (see the TRAJECTORY DRIFT FIX above), which is
+    # correct for a Y-up target because there the source's up already IS the target's
+    # up. On a Z-up target it is not: the source's up stays on Y, so the motion's
+    # vertical lands on a horizontal axis and the crouch's descent is lost - the
+    # character folds its legs and lifts its feet instead of lowering its hips.
+    # coord_q is the identity for a Y-up target, so Y-up rigs are unaffected.
+    global_pos_q_full = global_pos_q * coord_q
+
     gt_q_np = np.array(
         [
             global_transform_q.as_quat()[3],
@@ -2950,12 +2959,12 @@ def retarget_animation(
                 for sf in [cur_s_lfoot, cur_s_rfoot]:
                     if sf:
                         p = sf.world_location_animation.get(frames[0], sf.head)
-                        p_tgt = global_pos_q.apply(p * scale)
+                        p_tgt = global_pos_q_full.apply(p * scale)
                         s_foot_at_f0.append(p_tgt[t_up_axis_idx])
                 s_floor_f0_tgt = min(s_foot_at_f0) if s_foot_at_f0 else 0.0
 
             # Source hip at frame 0 in target space (for reference/delta computation)
-            s_hip_f0_tgt = global_pos_q.apply(s_pos_0 * scale)
+            s_hip_f0_tgt = global_pos_q_full.apply(s_pos_0 * scale)
 
             # CORRECT INITIAL POSITION:
             # Use the TARGET'S rest hip position as anchor.
@@ -2968,7 +2977,7 @@ def retarget_animation(
             for sf in [cur_s_lfoot, cur_s_rfoot]:
                 if sf:
                     p = sf.world_location_animation.get(frames[0], sf.head)
-                    foot_pos_0.append(global_pos_q.apply(p * scale))
+                    foot_pos_0.append(global_pos_q_full.apply(p * scale))
 
             if foot_pos_0:
                 s_center_0 = np.mean(foot_pos_0, axis=0)
@@ -2991,13 +3000,13 @@ def retarget_animation(
 
                 # Delta from frame 0 (in source space, scaled and rotated to target)
                 s_delta = s_pos_f - s_pos_0
-                t_delta = global_pos_q.apply(s_delta * scale)
+                t_delta = global_pos_q_full.apply(s_delta * scale)
 
                 # Target position = initial grounded position + delta
                 t_pos_f = initial_pos + t_delta
 
                 if preserve_position:
-                    t_pos_f = global_pos_q.apply(s_pos_f * scale)
+                    t_pos_f = global_pos_q_full.apply(s_pos_f * scale)
 
                 # Lock movement based on granular toggles or the legacy in_place flag
                 lock_x = in_place_x or in_place
