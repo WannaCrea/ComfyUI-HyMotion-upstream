@@ -361,6 +361,12 @@ def get_skeleton_height(skeleton: Skeleton) -> float:
                 "ltoe",
                 "lfoot",
                 "lFoot",
+                # UE5 Mannequin. Without these the lookup returns None on a UE rig
+                # and the code falls back to `total_len *= 2.0`, doubling the spine
+                # length instead of adding a leg: Manny measured 135 cm instead of
+                # 162, which skewed Auto-Stride to 0.8168.
+                "foot_l",
+                "ball_l",
             ]
         )
 
@@ -392,20 +398,23 @@ def get_skeleton_height(skeleton: Skeleton) -> float:
         if total_len > 0.1:
             return total_len
 
-    # 2. Fallback to Y-Range
-    y_min, y_max = 999999.0, -999999.0
+    # 2. Fallback: vertical extent of the bone heads along the rig's OWN up axis.
+    # This used to hardcode index 1 (Y), which is only the vertical in a Y-up world;
+    # on a Z-up rig it measured the forward extent instead.
+    up_idx = int(np.argmax(np.abs(_detect_up_axis(skeleton))))
+    v_min, v_max = 999999.0, -999999.0
     found_any = False
     for _, bone in skeleton.bones.items():
-        h_val = bone.head[1]
+        h_val = bone.head[up_idx]
         if abs(h_val) < 1e-6:
             continue
-        y_min = min(y_min, h_val)
-        y_max = max(y_max, h_val)
+        v_min = min(v_min, h_val)
+        v_max = max(v_max, h_val)
         found_any = True
 
-    if not found_any or (y_max - y_min) < 0.1:
+    if not found_any or (v_max - v_min) < 0.1:
         return 1.0
-    return y_max - y_min
+    return v_max - v_min
 
 
 # =============================================================================
@@ -2172,6 +2181,18 @@ def apply_retargeted_animation(
     apply_node(scene.GetRootNode())
 
 
+def _detect_up_axis(skel):
+    """Up axis of a target skeleton, read from where the head sits.
+
+    Z-up rigs (e.g. an FBX exported from Unreal) put the head far along Z; Y-up
+    rigs (Mixamo, SMPL, DAZ) put it along Y.
+    """
+    head = skel.get_bone_case_insensitive("head")
+    if head is not None and abs(head.head[2]) > abs(head.head[1]):
+        return np.array([0, 0, 1])
+    return np.array([0, 1, 0])
+
+
 def retarget_animation(
     src_skel: Skeleton,
     tgt_skel: Skeleton,
@@ -2242,7 +2263,13 @@ def retarget_animation(
                             )
 
                             if is_leg_part:
-                                target_v = np.array([0.0, -1.0, 0.0])  # Legs down
+                                # "Legs down" must use the target's own down axis.
+                                # (0,-1,0) is only down in a Y-up world; on a Z-up
+                                # rig (an FBX exported from UE) it levels the legs to
+                                # horizontal, which carries every child out of place
+                                # and collapses the character. For Y-up rigs this
+                                # evaluates to (0,-1,0), i.e. unchanged.
+                                target_v = -_detect_up_axis(tgt_skel)
                             else:
                                 target_v = (
                                     np.array([1.0, 0.0, 0.0])
@@ -2426,12 +2453,8 @@ def retarget_animation(
 
     # 1. World Rotations and Root Displacement Reference
     root_mapped = False
-    # Detect Target Up Axis (Blender is Z-Up)
-    t_up_axis = np.array([0, 1, 0])  # Default Y-Up
-    t_head = tgt_skel.get_bone_case_insensitive("head")
-    if t_head:
-        if abs(t_head.head[2]) > abs(t_head.head[1]):
-            t_up_axis = np.array([0, 0, 1])
+    # Detect Target Up Axis (single source of truth: also used by the smart-arm pre-pass)
+    t_up_axis = _detect_up_axis(tgt_skel)
 
     t_up_axis_idx = np.argmax(np.abs(t_up_axis))
 
@@ -2981,20 +3004,24 @@ def retarget_animation(
                 lock_z = in_place_z or in_place
                 lock_y = in_place_y
 
-                if t_up_axis[1] == 1:  # Y-Up
+                if t_up_axis[1] == 1:  # Y-Up: up is index 1, horizontals are 0 and 2
                     if lock_x:
                         t_pos_f[0] = t_rest_pos[0]
                     if lock_z:
                         t_pos_f[2] = t_rest_pos[2]
                     if lock_y:
                         t_pos_f[1] = t_rest_pos[1]
-                else:  # Z-Up
-                    if lock_z:
-                        t_pos_f[2] = t_rest_pos[2]
+                else:  # Z-Up: up is index 2, so the horizontals are 0 and 1
+                    # This branch used to repeat the Y-Up index assignments verbatim,
+                    # so on a Z-up rig (a UE FBX export) `in_place_z` locked the
+                    # VERTICAL to the rest hip height - flattening the crouch - while
+                    # the forward axis could not be locked at all and kept drifting.
                     if lock_x:
                         t_pos_f[0] = t_rest_pos[0]
-                    if lock_y:
+                    if lock_z:
                         t_pos_f[1] = t_rest_pos[1]
+                    if lock_y:
+                        t_pos_f[2] = t_rest_pos[2]
 
                 # Convert to parent-local space
                 pname = t_bone_main.parent_name
@@ -3157,6 +3184,24 @@ def retarget_animation(
         ("ik_foot_r", "foot_r"),
     ]
     
+    snapped_ik_world = {}
+
+    def _ik_parent_rot(name, frame):
+        """Parent world rotation for an IK bone.
+
+        Prefer the frame snapped earlier in this loop: get_fbx_world() rebuilds it
+        from tgt_world_anims, which the snapping below never writes, so a child IK
+        bone (ik_hand_l hangs off ik_hand_gun, itself snapped to hand_r) was
+        converted against a frame the file does not use and landed tens of cm away.
+        """
+        hit = snapped_ik_world.get((name or "").lower(), {}).get(frame)
+        return hit[0] if hit is not None else get_fbx_world(name, frame)
+
+    def _ik_parent_pos(name, frame):
+        """Parent world position, for the same reason as _ik_parent_rot."""
+        hit = snapped_ik_world.get((name or "").lower(), {}).get(frame)
+        return hit[1] if hit is not None else get_fbx_world_pos(name, frame)
+
     for ik_name, bio_name in ik_map:
         t_ik = tgt_skel.get_bone_case_insensitive(ik_name)
         t_bio = tgt_skel.get_bone_case_insensitive(bio_name)
@@ -3172,27 +3217,31 @@ def retarget_animation(
                 bio_world_q = tgt_world_anims.get(t_bio.name, {}).get(f)
                 if bio_world_q is None:
                     bio_world_q = tgt_skel.node_rest_rotations.get(t_bio.name, np.array([1, 0, 0, 0]))
-                
+
                 if pname:
-                    parent_world_f = get_fbx_world(pname, f)
+                    parent_world_f = _ik_parent_rot(pname, f)
                 else:
                     parent_world_f = np.array([1, 0, 0, 0])
-                
+
                 l_rot = quaternion_multiply(quaternion_inverse(parent_world_f), bio_world_q)
                 ret_rots[t_ik.name][f] = l_rot / (np.linalg.norm(l_rot) + 1e-12)
 
                 # 2. Translation Snapping
                 bio_world_pos = get_fbx_world_pos(t_bio.name, f)
                 if pname:
-                    p_pos = get_fbx_world_pos(pname, f)
-                    p_rot_q = get_fbx_world(pname, f)
+                    p_pos = _ik_parent_pos(pname, f)
+                    p_rot_q = _ik_parent_rot(pname, f)
                     p_rot = R.from_quat([p_rot_q[1], p_rot_q[2], p_rot_q[3], p_rot_q[0]])
-                    
+
                     # local = inv(p_rot) * (world - p_pos)
                     l_pos = p_rot.inv().apply(bio_world_pos - p_pos)
                     ret_locs[t_ik.name][f] = l_pos
                 else:
                     ret_locs[t_ik.name][f] = bio_world_pos
+
+                # Publish this bone's world frame so its IK children are converted
+                # against what is actually written, not against a reconstruction.
+                snapped_ik_world.setdefault(t_ik.name.lower(), {})[f] = (bio_world_q, bio_world_pos)
 
     return ret_rots, ret_locs, active
 
